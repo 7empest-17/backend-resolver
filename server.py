@@ -6,14 +6,37 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Roku Stream Resolver Pro")
 
-# Configura aquí el dominio base donde está montado el sitio/API
-LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"  # <-- Cambia esto por el dominio real
+LAMOVIE_API_BASE = "https://TU-DOMINIO-AQUI"  # <-- Coloca aquí la URL base de Lamovie
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-def resolver_con_ytdlp(embed_url: str) -> str:
-    """Extrae la URL directa (.m3u8 o .mp4) usando yt-dlp."""
+def resolver_goodstream(url: str) -> str:
+    """Extrae el enlace hls (.m3u8) directamente del HTML de Goodstream."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        # Busca enlaces directos a .m3u8 dentro de variables o scripts
+        match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', r.text)
+        if match:
+            return match.group(1).replace(r"\/", "/")
+    except Exception:
+        pass
+    return None
+
+def resolver_voe(url: str) -> str:
+    """Extrae el stream directo de Voe."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        match = re.search(r"['\"]hls['\"]\s*:\s*['\"]([^'\"]+)['\"]", r.text)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+def resolver_ytdlp(url: str) -> str:
+    """Intenta resolver con yt-dlp como respaldo genérico."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -21,32 +44,15 @@ def resolver_con_ytdlp(embed_url: str) -> str:
         "format": "best"
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(embed_url, download=False)
+        info = ydl.extract_info(url, download=False)
         return info.get("url")
-
-def resolver_voe_manual(embed_url: str) -> str:
-    """Extractor ligero por Regex para embeds de Voe."""
-    try:
-        res = requests.get(embed_url, headers=HEADERS, timeout=8)
-        match = re.search(r"['\"]hls['\"]\s*:\s*['\"]([^'\"]+)['\"]", res.text)
-        return match.group(1) if match else None
-    except Exception:
-        return None
-
-def validar_stream(url: str) -> bool:
-    """Comprueba que el .m3u8 devuelva un código 200/activo antes de mandarlo a Roku."""
-    try:
-        r = requests.head(url, headers=HEADERS, timeout=4, allow_redirects=True)
-        return r.status_code in [200, 206, 302]
-    except Exception:
-        return False
 
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "stream-resolver-multi"}
+    return {"status": "ok", "service": "stream-resolver"}
 
 @app.get("/api/stream")
-def get_streams(post_id: int = Query(..., description="ID del post en la API")):
+def get_stream(post_id: int = Query(..., description="ID del post")):
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
     
     try:
@@ -57,41 +63,43 @@ def get_streams(post_id: int = Query(..., description="ID del post en la API")):
 
     embeds = res_json.get("data", {}).get("embeds", [])
     if not embeds:
-        raise HTTPException(status_code=404, detail="No se encontraron servidores para este título")
+        raise HTTPException(status_code=404, detail="No se encontraron servidores para este post")
 
     streams_disponibles = []
 
-    # Procesa y valida cada embed disponible
     for i, embed in enumerate(embeds):
         raw_url = embed.get("url", "").replace(r"\/", "/")
-        servidor_nombre = embed.get("server", f"Opcion {i+1}")
+        servidor = embed.get("server", f"Opcion {i+1}")
         idioma = embed.get("lang", "Latino")
-        calidad = embed.get("quality", "HD")
+        calidad = embed.get("quality", "Full HD")
+        stream_url = None
 
-        candidate_url = None
         try:
-            if "voe.sx" in raw_url:
-                candidate_url = resolver_voe_manual(raw_url) or resolver_con_ytdlp(raw_url)
+            if "goodstream" in raw_url:
+                stream_url = resolver_goodstream(raw_url) or resolver_ytdlp(raw_url)
+            elif "voe.sx" in raw_url:
+                stream_url = resolver_voe(raw_url) or resolver_ytdlp(raw_url)
             else:
-                candidate_url = resolver_con_ytdlp(raw_url)
+                stream_url = resolver_ytdlp(raw_url)
 
-            # Si el enlace es válido y responde, lo agregamos a la lista de opciones
-            if candidate_url and validar_stream(candidate_url):
+            if stream_url:
                 streams_disponibles.append({
                     "id": i,
-                    "nombre": f"{servidor_nombre} ({idioma} - {calidad})",
-                    "stream_format": "hls" if ".m3u8" in candidate_url else "mp4",
-                    "url": candidate_url
+                    "nombre": f"{servidor} ({idioma} - {calidad})",
+                    "stream_format": "hls" if ".m3u8" in stream_url else "mp4",
+                    "url": stream_url
                 })
         except Exception:
             continue
 
     if not streams_disponibles:
-        raise HTTPException(status_code=500, detail="Ningún servidor de streaming está disponible en este momento")
+        raise HTTPException(status_code=500, detail="No se pudo extraer ningún stream de la lista de embeds")
 
+    # Retorna el primer servidor funcional y la lista completa por si Roku necesita rotar
     return {
         "status": "success",
         "post_id": post_id,
+        "selected_stream": streams_disponibles[0],
         "total": len(streams_disponibles),
         "streams": streams_disponibles
     }
