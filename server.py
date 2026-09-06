@@ -266,12 +266,14 @@ def resolve_by_title(
 
         return value
 
+
     search_url = (
-        f"{LAMOVIE_API_BASE}/search"
-        f"?postType=movies"
-        f"&q={requests.utils.quote(title)}"
-        f"&postsPerPage=20"
+    f"{LAMOVIE_API_BASE}/search"
+    f"?postType=any"
+    f"&q={requests.utils.quote(title)}"
+    f"&postsPerPage=20"
     )
+    
 
     try:
         r = requests.get(search_url, headers=HEADERS, timeout=8)
