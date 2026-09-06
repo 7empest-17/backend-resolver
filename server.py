@@ -6,17 +6,34 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Roku Stream Resolver Pro")
 
-LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"  # <-- Coloca aquí la URL base de Lamovie
+LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
+# 1. Definición de la prioridad oficial del sitio
+SERVER_PRIORITY = {
+    "vimeos": 1,
+    "goodstream": 2,
+    "voe": 3
+}
+
+def resolver_vimeos(url: str) -> str:
+    """Extrae el enlace hls (.m3u8) directamente del reproductor de Vimeos."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', r.text)
+        if match:
+            return match.group(1).replace(r"\/", "/")
+    except Exception:
+        pass
+    return None
+
 def resolver_goodstream(url: str) -> str:
     """Extrae el enlace hls (.m3u8) directamente del HTML de Goodstream."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=8)
-        # Busca enlaces directos a .m3u8 dentro de variables o scripts
         match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', r.text)
         if match:
             return match.group(1).replace(r"\/", "/")
@@ -36,7 +53,7 @@ def resolver_voe(url: str) -> str:
     return None
 
 def resolver_ytdlp(url: str) -> str:
-    """Intenta resolver con yt-dlp como respaldo genérico."""
+    """Extractor de respaldo genérico."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -46,6 +63,14 @@ def resolver_ytdlp(url: str) -> str:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info.get("url")
+
+def obtener_peso_prioridad(embed: dict) -> int:
+    """Asigna el peso numérico según la prioridad: vimeos (1), goodstream (2), voe (3)."""
+    raw_url = embed.get("url", "").lower()
+    for servidor, peso in SERVER_PRIORITY.items():
+        if servidor in raw_url:
+            return peso
+    return 99  # Cualquier otro servidor que no esté en la lista de prioridad queda al final
 
 @app.get("/")
 def home():
@@ -65,9 +90,12 @@ def get_stream(post_id: int = Query(..., description="ID del post")):
     if not embeds:
         raise HTTPException(status_code=404, detail="No se encontraron servidores para este post")
 
+    # 2. Ordenar los embeds según el orden estricto de prioridad
+    embeds_ordenados = sorted(embeds, key=obtener_peso_prioridad)
+
     streams_disponibles = []
 
-    for i, embed in enumerate(embeds):
+    for i, embed in enumerate(embeds_ordenados):
         raw_url = embed.get("url", "").replace(r"\/", "/")
         servidor = embed.get("server", f"Opcion {i+1}")
         idioma = embed.get("lang", "Latino")
@@ -75,7 +103,9 @@ def get_stream(post_id: int = Query(..., description="ID del post")):
         stream_url = None
 
         try:
-            if "goodstream" in raw_url:
+            if "vimeos" in raw_url:
+                stream_url = resolver_vimeos(raw_url) or resolver_ytdlp(raw_url)
+            elif "goodstream" in raw_url:
                 stream_url = resolver_goodstream(raw_url) or resolver_ytdlp(raw_url)
             elif "voe.sx" in raw_url:
                 stream_url = resolver_voe(raw_url) or resolver_ytdlp(raw_url)
@@ -93,9 +123,8 @@ def get_stream(post_id: int = Query(..., description="ID del post")):
             continue
 
     if not streams_disponibles:
-        raise HTTPException(status_code=500, detail="No se pudo extraer ningún stream de la lista de embeds")
+        raise HTTPException(status_code=500, detail="No se pudo extraer ningún stream disponible")
 
-    # Retorna el primer servidor funcional y la lista completa por si Roku necesita rotar
     return {
         "status": "success",
         "post_id": post_id,
