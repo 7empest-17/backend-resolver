@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI()
 
-LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1/hit?nocache="  # Reemplaza por la URL base real
+LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"  # Reemplaza por la URL base real
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
