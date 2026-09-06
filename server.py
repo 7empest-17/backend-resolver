@@ -1,23 +1,41 @@
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Roku Stream Resolver Pro")
+app = FastAPI(title="Roku Stream Resolver Master")
+
+# Habilitar CORS para evitar restricciones en pruebas de clientes
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"
-
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 }
 
-# 1. Prioridad oficial del sitio
+# 1. Prioridad de servidores solicitada
 SERVER_PRIORITY = {
     "vimeos": 1,
     "goodstream": 2,
     "voe": 3
 }
+
+# 2. Cache en memoria con TTL de 2 horas
+STREAM_CACHE = {}
+CACHE_TTL = 7200
+
 
 def unpack_packer(html: str) -> str:
     """Desempaqueta scripts ofuscados con eval(function(p,a,c,k,e,d)...)."""
@@ -26,7 +44,6 @@ def unpack_packer(html: str) -> str:
         return html
     payload, radix, count, symtab = match.groups()
     radix = int(radix)
-    count = int(count)
     symtab = symtab.split('|')
 
     def unbase(val):
@@ -45,85 +62,140 @@ def unpack_packer(html: str) -> str:
 
     return re.sub(r"\b\w+\b", replace_token, payload)
 
+
 def resolver_vimeos(url: str) -> str:
-    """Extrae el enlace hls (.m3u8) desempaquetando el reproductor de Vimeos."""
+    """Extrae stream HLS para hosts Vimeos y clones asociados."""
     try:
-        headers = {
-            "User-Agent": HEADERS["User-Agent"],
-            "Referer": "https://lamovie.org/"
-        }
-        r = requests.get(url, headers=headers, timeout=8)
+        req_headers = HEADERS.copy()
+        req_headers["Referer"] = "https://lamovie.org/"
+        r = requests.get(url, headers=req_headers, timeout=6)
         html = r.text
 
-        # 1. Búsqueda directa
+        # 1. Búsqueda directa de m3u8
         match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', html)
         if match:
             return match.group(1).replace(r"\/", "/")
 
-        # 2. Desempaquetado si usa Packer
+        # 2. Desempaquetado JS
         unpacked = unpack_packer(html)
         match_unpacked = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', unpacked)
         if match_unpacked:
             return match_unpacked.group(1).replace(r"\/", "/")
 
-        # 3. Búsqueda en propiedad 'file' o 'source'
-        match_file = re.search(r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', unpacked)
+        # 3. Propiedad file o source
+        match_file = re.search(r'(?:file|source|src)\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']', unpacked)
         if match_file:
             return match_file.group(1).replace(r"\/", "/")
     except Exception:
         pass
     return None
 
+
 def resolver_goodstream(url: str) -> str:
-    """Extrae el enlace directo de Goodstream."""
+    """Extrae stream directo de Goodstream."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', r.text)
+        req_headers = HEADERS.copy()
+        req_headers["Referer"] = "https://lamovie.org/"
+        r = requests.get(url, headers=req_headers, timeout=6)
+        html = r.text
+        match = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', html)
         if match:
             return match.group(1).replace(r"\/", "/")
+        
+        unpacked = unpack_packer(html)
+        match_unpacked = re.search(r'(https?://[^"\'\s]+\.m3u8[^"\'\s]*)', unpacked)
+        if match_unpacked:
+            return match_unpacked.group(1).replace(r"\/", "/")
     except Exception:
         pass
     return None
+
 
 def resolver_voe(url: str) -> str:
-    """Extrae el enlace directo de Voe."""
+    """Extrae stream HLS o MP4 de Voe."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        match = re.search(r"['\"]hls['\"]\s*:\s*['\"]([^'\"]+)['\"]", r.text)
-        if match:
-            return match.group(1).replace(r"\/", "/")
+        r = requests.get(url, headers=HEADERS, timeout=6)
+        html = r.text
+        match_hls = re.search(r"['\"]hls['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if match_hls:
+            return match_hls.group(1).replace(r"\/", "/")
+        match_mp4 = re.search(r"['\"]mp4['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if match_mp4:
+            return match_mp4.group(1).replace(r"\/", "/")
     except Exception:
         pass
     return None
 
+
 def resolver_ytdlp(url: str) -> str:
-    """Extractor universal de respaldo."""
+    """Extractor universal yt-dlp para hosts genéricos (hlswish, filemoon, etc.)."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
-        "format": "best"
+        "format": "best",
+        "socket_timeout": 6
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info.get("url")
 
+
 def obtener_peso_prioridad(embed: dict) -> int:
-    """Calcula el orden numérico: vimeos (1), goodstream (2), voe (3), otros (99)."""
+    """Ordena los servidores: vimeos (1), goodstream (2), voe (3), otros (99)."""
     raw_url = embed.get("url", "").lower()
     for servidor, peso in SERVER_PRIORITY.items():
         if servidor in raw_url:
             return peso
     return 99
 
+
+def procesar_un_embed(index: int, embed: dict) -> dict:
+    """Ejecuta la extracción de un embed individual."""
+    raw_url = embed.get("url", "").replace(r"\/", "/")
+    servidor = embed.get("server", "Online")
+    idioma = embed.get("lang", "Latino")
+    calidad = embed.get("quality", "Full HD")
+    stream_url = None
+
+    try:
+        if "vimeos" in raw_url:
+            stream_url = resolver_vimeos(raw_url) or resolver_ytdlp(raw_url)
+        elif "goodstream" in raw_url:
+            stream_url = resolver_goodstream(raw_url) or resolver_ytdlp(raw_url)
+        elif "voe.sx" in raw_url:
+            stream_url = resolver_voe(raw_url) or resolver_ytdlp(raw_url)
+        else:
+            stream_url = resolver_ytdlp(raw_url)
+    except Exception:
+        pass
+
+    if stream_url:
+        return {
+            "id": index,
+            "peso": obtener_peso_prioridad(embed),
+            "nombre": f"{servidor} ({idioma} - {calidad})",
+            "stream_format": "hls" if ".m3u8" in stream_url else "mp4",
+            "url": stream_url
+        }
+    return None
+
+
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "stream-resolver"}
+    return {"status": "ok", "service": "roku-stream-resolver-v2"}
+
 
 @app.get("/api/stream")
 def get_stream(post_id: int = Query(..., description="ID del post en la API")):
+    ahora = time.time()
+
+    # 1. Retorno desde memoria si ya fue resuelto
+    if post_id in STREAM_CACHE and STREAM_CACHE[post_id]["expires_at"] > ahora:
+        return STREAM_CACHE[post_id]["data"]
+
+    # 2. Consulta de embeds a Lamovie
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
-    
     try:
         r = requests.get(player_url, headers=HEADERS, timeout=10)
         res_json = r.json()
@@ -134,45 +206,67 @@ def get_stream(post_id: int = Query(..., description="ID del post en la API")):
     if not embeds:
         raise HTTPException(status_code=404, detail="No se encontraron servidores para este post")
 
-    # Ordenar lista aplicando la prioridad
-    embeds_ordenados = sorted(embeds, key=obtener_peso_prioridad)
+    # 3. Extracción en paralelo (hasta 5 servidores simultáneos)
+    resultados = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(procesar_un_embed, idx, emb) for idx, emb in enumerate(embeds)]
+        for future in as_completed(futures):
+            resultado = future.result()
+            if resultado:
+                resultados.append(resultado)
 
-    streams_disponibles = []
+    if not resultados:
+        raise HTTPException(status_code=500, detail="No se pudo extraer ningún stream funcional")
 
-    for i, embed in enumerate(embeds_ordenados):
-        raw_url = embed.get("url", "").replace(r"\/", "/")
-        servidor = embed.get("server", f"Opcion {i+1}")
-        idioma = embed.get("lang", "Latino")
-        calidad = embed.get("quality", "Full HD")
-        stream_url = None
+    # 4. Ordenar resultados por la prioridad solicitada
+    resultados.sort(key=lambda x: (x["peso"], x["id"]))
 
-        try:
-            if "vimeos" in raw_url:
-                stream_url = resolver_vimeos(raw_url) or resolver_ytdlp(raw_url)
-            elif "goodstream" in raw_url:
-                stream_url = resolver_goodstream(raw_url) or resolver_ytdlp(raw_url)
-            elif "voe.sx" in raw_url:
-                stream_url = resolver_voe(raw_url) or resolver_ytdlp(raw_url)
-            else:
-                stream_url = resolver_ytdlp(raw_url)
+    # Limpiar campo temporal de peso
+    for item in resultados:
+        del item["peso"]
 
-            if stream_url:
-                streams_disponibles.append({
-                    "id": i,
-                    "nombre": f"{servidor} ({idioma} - {calidad})",
-                    "stream_format": "hls" if ".m3u8" in stream_url else "mp4",
-                    "url": stream_url
-                })
-        except Exception:
-            continue
-
-    if not streams_disponibles:
-        raise HTTPException(status_code=500, detail="No se pudo extraer ningún stream disponible")
-
-    return {
+    respuesta = {
         "status": "success",
         "post_id": post_id,
-        "selected_stream": streams_disponibles[0],
-        "total": len(streams_disponibles),
-        "streams": streams_disponibles
+        "selected_stream": resultados[0],
+        "total": len(resultados),
+        "streams": resultados
     }
+
+    # 5. Guardar en caché
+    STREAM_CACHE[post_id] = {
+        "data": respuesta,
+        "expires_at": ahora + CACHE_TTL
+    }
+
+    return respuesta
+
+
+@app.get("/api/resolve_by_title")
+def resolve_by_title(
+    title: str = Query(..., description="Título de la película o serie"),
+    year: str = Query(None, description="Año de estreno opcional")
+):
+    """Permite a Roku pasar el nombre directamente sin conocer el post_id previamente."""
+    search_url = f"{LAMOVIE_API_BASE}/search?postType=movies&q={requests.utils.quote(title)}&postsPerPage=5"
+    try:
+        r = requests.get(search_url, headers=HEADERS, timeout=8)
+        data = r.json().get("data", {})
+        posts = data.get("posts", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error buscando en la API: {str(e)}")
+
+    if not posts:
+        raise HTTPException(status_code=404, detail="Título no encontrado en la base de datos")
+
+    selected_id = None
+    if year:
+        for post in posts:
+            if str(post.get("release_date", "")).startswith(year):
+                selected_id = post.get("_id")
+                break
+
+    if not selected_id:
+        selected_id = posts[0].get("_id")
+
+    return get_stream(post_id=selected_id)
