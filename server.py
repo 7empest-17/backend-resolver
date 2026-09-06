@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Roku Stream Resolver Pro")
 
-LAMOVIE_API_BASE = "https://TU-DOMINIO-AQUI"  # <-- Coloca aquí la URL base de Lamovie
+LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"  # <-- Coloca aquí la URL base de Lamovie
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
