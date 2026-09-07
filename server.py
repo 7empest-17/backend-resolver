@@ -344,16 +344,16 @@ def resolve_by_title(
     # ---------------------------------------------------------
     if year:
         for post in posts:
-            post_title = normalize_text(
-                post.get("original_title")
-                or post.get("title")
-                or post.get("post_title")
-            )
+            post_titles = [
+                normalize_text(post.get("original_title")),
+                normalize_text(post.get("title")),
+                normalize_text(post.get("post_title"))
+            ]
 
             release_date = str(post.get("release_date", ""))
             post_year = release_date[:4]
 
-            if post_title == target_title and post_year == str(year):
+            if target_title in post_titles and post_year == str(year):
                 selected_post = post
                 break
 
@@ -362,13 +362,13 @@ def resolve_by_title(
     # ---------------------------------------------------------
     if not selected_post:
         for post in posts:
-            post_title = normalize_text(
-                post.get("original_title")
-                or post.get("title")
-                or post.get("post_title")
-            )
+            post_titles = [
+                normalize_text(post.get("original_title")),
+                normalize_text(post.get("title")),
+                normalize_text(post.get("post_title"))
+            ]
 
-            if post_title == target_title:
+            if target_title in post_titles:
                 selected_post = post
                 break
 
@@ -377,11 +377,11 @@ def resolve_by_title(
     # ---------------------------------------------------------
     if not selected_post and year:
         for post in posts:
-            post_title = normalize_text(
-                post.get("original_title")
-                or post.get("title")
-                or post.get("post_title")
-            )
+            post_titles = [
+                normalize_text(post.get("original_title")),
+                normalize_text(post.get("title")),
+                normalize_text(post.get("post_title"))
+            ]
 
             release_date = str(post.get("release_date", ""))
             post_year = release_date[:4]
@@ -389,8 +389,11 @@ def resolve_by_title(
             if (
                 post_year == str(year)
                 and (
-                    target_title in post_title
-                    or post_title in target_title
+                    any(
+                        target_title in post_title
+                        or post_title in target_title
+                        for post_title in post_titles
+                    )
                 )
             ):
                 selected_post = post
