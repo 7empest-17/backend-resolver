@@ -19,6 +19,8 @@ app.add_middleware(
 )
 
 LAMOVIE_API_BASE = "https://lamovie.org/wp-api/v1"
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TMDB_API_BASE = "https://api.themoviedb.org/3"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -241,6 +243,38 @@ def get_stream(post_id: int = Query(..., description="ID del post en la API")):
 
     return respuesta
 
+def get_tmdb_localized_title(title: str, year: str = None):
+    if not TMDB_API_KEY:
+        return None
+
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": title,
+        "language": "es-MX",
+        "include_adult": "false"
+    }
+
+    if year:
+        params["year"] = year
+
+    try:
+        response = requests.get(
+            f"{TMDB_API_BASE}/search/movie",
+            params=params,
+            timeout=8
+        )
+
+        response.raise_for_status()
+
+        results = response.json().get("results", [])
+
+        if results:
+            return results[0].get("title")
+
+    except Exception:
+        pass
+
+    return None
 
 @app.get("/api/resolve_by_title")
 def resolve_by_title(
@@ -266,11 +300,17 @@ def resolve_by_title(
 
         return value
 
+    tmdb_title = get_tmdb_localized_title(title, year)
 
+    search_title = tmdb_title or title
+
+    target_title = normalize_text(search_title)
+    
     search_url = (
     f"{LAMOVIE_API_BASE}/search"
     f"?postType=any"
-    f"&q={requests.utils.quote(title)}"
+    f"&q={requests.utils.quote(search_title)}"
+        
     f"&postsPerPage=20"
     )
     
@@ -294,7 +334,8 @@ def resolve_by_title(
             detail="Título no encontrado en la base de datos"
         )
 
-    target_title = normalize_text(title)
+
+    
 
     selected_post = None
 
