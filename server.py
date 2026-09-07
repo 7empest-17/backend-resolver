@@ -34,9 +34,14 @@ SERVER_PRIORITY = {
     "voe": 3
 }
 
-# 2. Cache en memoria con TTL de 2 horas
+# 2. Caché dividida:
+# - SEARCH_CACHE: datos estables (título/año -> post encontrado). Dura 2 horas.
+# - STREAM_CACHE: enlaces de video firmados. Dura 60 segundos solo para absorber reintentos.
+SEARCH_CACHE = {}
+SEARCH_CACHE_TTL = 7200
+
 STREAM_CACHE = {}
-CACHE_TTL = 7200
+STREAM_CACHE_TTL = 60
 
 
 def unpack_packer(html: str) -> str:
@@ -192,11 +197,11 @@ def home():
 def get_stream(post_id: int = Query(..., description="ID del post en la API")):
     ahora = time.time()
 
-    # 1. Retorno desde memoria si ya fue resuelto
+    # 1. Retorno desde memoria únicamente si no ha expirado la ventana corta (60s)
     if post_id in STREAM_CACHE and STREAM_CACHE[post_id]["expires_at"] > ahora:
         return STREAM_CACHE[post_id]["data"]
 
-    # 2. Consulta de embeds a Lamovie
+    # 2. Consulta de embeds frescos a Lamovie
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
     try:
         r = requests.get(player_url, headers=HEADERS, timeout=10)
@@ -235,13 +240,14 @@ def get_stream(post_id: int = Query(..., description="ID del post en la API")):
         "streams": resultados
     }
 
-    # 5. Guardar en caché
+    # 5. Guardar en caché con TTL corto (60 s) para evitar tokens caducados
     STREAM_CACHE[post_id] = {
         "data": respuesta,
-        "expires_at": ahora + CACHE_TTL
+        "expires_at": ahora + STREAM_CACHE_TTL
     }
 
     return respuesta
+
 
 def get_tmdb_localized_title(title: str, year: str = None):
     if not TMDB_API_KEY:
@@ -263,167 +269,131 @@ def get_tmdb_localized_title(title: str, year: str = None):
             params=params,
             timeout=8
         )
-
         response.raise_for_status()
-
         results = response.json().get("results", [])
-
         if results:
             return results[0].get("title")
-
     except Exception:
         pass
 
     return None
+
 
 @app.get("/api/resolve_by_title")
 def resolve_by_title(
     title: str = Query(..., description="Título de la película o serie"),
     year: str = Query(None, description="Año de estreno opcional")
 ):
-    """Busca una película por título y año y devuelve su stream usando el post_id encontrado."""
+    """Busca una película por título y año y devuelve su stream fresco usando el post_id encontrado."""
 
     def normalize_text(value):
         if not value:
             return ""
-
         value = str(value).lower().strip()
-
-        # Quitar año al final del título si viene incluido
         value = re.sub(r"\s*\(\d{4}\)\s*$", "", value)
-
-        # Sustituir caracteres no alfanuméricos por espacios
         value = re.sub(r"[^a-z0-9áéíóúüñ]+", " ", value)
+        return re.sub(r"\s+", " ", value).strip()
 
-        # Quitar espacios duplicados
-        value = re.sub(r"\s+", " ", value).strip()
-
-        return value
-
-    tmdb_title = get_tmdb_localized_title(title, year)
-
-    search_title = tmdb_title or title
-
-    target_title = normalize_text(search_title)
-    
-    search_url = (
-    f"{LAMOVIE_API_BASE}/search"
-    f"?postType=any"
-    f"&q={requests.utils.quote(search_title)}"
-        
-    f"&postsPerPage=20"
-    )
-    
-
-    try:
-        r = requests.get(search_url, headers=HEADERS, timeout=8)
-        r.raise_for_status()
-
-        data = r.json().get("data", {})
-        posts = data.get("posts", [])
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error buscando en la API: {str(e)}"
-        )
-
-    if not posts:
-        raise HTTPException(
-            status_code=404,
-            detail="Título no encontrado en la base de datos"
-        )
-
-
-    
+    ahora = time.time()
+    clean_year = year.strip()[:4] if year and year.strip() else ""
+    cache_key = f"{title.lower().strip()}_{clean_year}"
 
     selected_post = None
 
-    # ---------------------------------------------------------
-    # 1. Coincidencia exacta de título + año
-    # ---------------------------------------------------------
-    if year:
-        for post in posts:
-            post_titles = [
-                normalize_text(post.get("original_title")),
-                normalize_text(post.get("title")),
-                normalize_text(post.get("post_title"))
-            ]
+    # 1. Revisar si ya conocemos qué post_id corresponde a este título (Caché de 2 horas)
+    if cache_key in SEARCH_CACHE and SEARCH_CACHE[cache_key]["expires_at"] > ahora:
+        selected_post = SEARCH_CACHE[cache_key]["post"]
 
-            release_date = str(post.get("release_date", ""))
-            post_year = release_date[:4]
-
-            if target_title in post_titles and post_year == str(year):
-                selected_post = post
-                break
-
-    # ---------------------------------------------------------
-    # 2. Coincidencia exacta de título sin año
-    # ---------------------------------------------------------
     if not selected_post:
-        for post in posts:
-            post_titles = [
-                normalize_text(post.get("original_title")),
-                normalize_text(post.get("title")),
-                normalize_text(post.get("post_title"))
-            ]
-
-            if target_title in post_titles:
-                selected_post = post
-                break
-
-    # ---------------------------------------------------------
-    # 3. Coincidencia parcial + año
-    # ---------------------------------------------------------
-    if not selected_post and year:
-        for post in posts:
-            post_titles = [
-                normalize_text(post.get("original_title")),
-                normalize_text(post.get("title")),
-                normalize_text(post.get("post_title"))
-            ]
-
-            release_date = str(post.get("release_date", ""))
-            post_year = release_date[:4]
-
-            if (
-                post_year == str(year)
-                and (
-                    any(
-                        target_title in post_title
-                        or post_title in target_title
-                        for post_title in post_titles
-                    )
-                )
-            ):
-                selected_post = post
-                break
-
-    # ---------------------------------------------------------
-    # Si no encontramos coincidencia suficientemente segura
-    # ---------------------------------------------------------
-    if not selected_post:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No se encontró una coincidencia segura para '{title}'"
-                   + (f" ({year})" if year else "")
+        tmdb_title = get_tmdb_localized_title(title, year)
+        search_title = tmdb_title or title
+        target_title = normalize_text(search_title)
+        
+        search_url = (
+            f"{LAMOVIE_API_BASE}/search"
+            f"?postType=any"
+            f"&q={requests.utils.quote(search_title)}"
+            f"&postsPerPage=20"
         )
 
-    selected_id = selected_post.get("_id")
+        try:
+            r = requests.get(search_url, headers=HEADERS, timeout=8)
+            r.raise_for_status()
+            data = r.json().get("data", {})
+            posts = data.get("posts", [])
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Error buscando en la API: {str(e)}"
+            )
 
+        if not posts:
+            raise HTTPException(
+                status_code=404,
+                detail="Título no encontrado en la base de datos"
+            )
+
+        # A. Coincidencia exacta de título + año
+        if clean_year:
+            for post in posts:
+                post_titles = [
+                    normalize_text(post.get("original_title")),
+                    normalize_text(post.get("title")),
+                    normalize_text(post.get("post_title"))
+                ]
+                post_year = str(post.get("release_date", ""))[:4]
+                if target_title in post_titles and post_year == clean_year:
+                    selected_post = post
+                    break
+
+        # B. Coincidencia exacta de título sin año
+        if not selected_post:
+            for post in posts:
+                post_titles = [
+                    normalize_text(post.get("original_title")),
+                    normalize_text(post.get("title")),
+                    normalize_text(post.get("post_title"))
+                ]
+                if target_title in post_titles:
+                    selected_post = post
+                    break
+
+        # C. Coincidencia parcial + año
+        if not selected_post and clean_year:
+            for post in posts:
+                post_titles = [
+                    normalize_text(post.get("original_title")),
+                    normalize_text(post.get("title")),
+                    normalize_text(post.get("post_title"))
+                ]
+                post_year = str(post.get("release_date", ""))[:4]
+                if post_year == clean_year and any(target_title in pt or pt in target_title for pt in post_titles):
+                    selected_post = post
+                    break
+
+        if not selected_post:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No se encontró una coincidencia segura para '{title}'"
+                       + (f" ({year})" if year else "")
+            )
+
+        # Guardar en la caché de búsqueda estable (2 horas)
+        SEARCH_CACHE[cache_key] = {
+            "post": selected_post,
+            "expires_at": ahora + SEARCH_CACHE_TTL
+        }
+
+    selected_id = selected_post.get("_id")
     if not selected_id:
         raise HTTPException(
             status_code=502,
             detail="La API encontró el título pero no devolvió _id"
         )
 
-    # ---------------------------------------------------------
-    # Usar el mismo resolver que ya funciona
-    # ---------------------------------------------------------
+    # 2. Obtener siempre el stream en vivo (o dentro de la ventana de 60s)
     result = get_stream(post_id=selected_id)
 
-    # Agregamos información del mapeo para poder comprobarlo
-    # desde Roku/Render sin modificar el resultado original.
     if isinstance(result, dict):
         result["mapping"] = {
             "requested_title": title,
