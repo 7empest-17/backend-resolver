@@ -135,14 +135,20 @@ def resolver_voe(url: str) -> str:
 
 
 def resolver_ytdlp(url: str) -> str:
-    """Extractor universal yt-dlp para hosts genéricos (hlswish, filemoon, etc.)."""
+    """Extractor universal yt-dlp con impersonación para sitios con anti-bot."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
         "format": "best",
-        "socket_timeout": 6
+        "socket_timeout": 10,
+        "extractor_args": {
+            "generic": {
+                "impersonate": [""]
+            }
+        }
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info.get("url")
