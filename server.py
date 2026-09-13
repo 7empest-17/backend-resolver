@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 
+import hashlib
 import requests
 from urllib.parse import urlparse, urljoin
 import yt_dlp
@@ -98,6 +99,14 @@ def extract_m3u8(html: str):
 def _safe_host(url: str) -> str:
     try:
         return urlparse(url).netloc or "unknown"
+    except Exception:
+        return "unknown"
+
+
+
+def _safe_stream_fingerprint(url: str) -> str:
+    try:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     except Exception:
         return "unknown"
 
@@ -539,9 +548,10 @@ def _resolve_post(post_id: int, attempt: int = 0):
     }
 
     logger.info(
-        "RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | index=%s | motivo=%s | host=%s | attempt=%s | %.0fms",
+        "RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | index=%s | motivo=%s | host=%s | fp=%s | attempt=%s | %.0fms",
         post_id, len(resultados), resultados[selected_index].get("nombre"), selected_index,
-        selected_reason, _safe_host(resultados[selected_index].get("url", "")), attempt,
+        selected_reason, _safe_host(resultados[selected_index].get("url", "")),
+        _safe_stream_fingerprint(resultados[selected_index].get("url", "")), attempt,
         (time.monotonic()-started)*1000,
     )
 
@@ -715,5 +725,5 @@ def resolve_by_title(
         "post_id": selected_id,
     }
     selected = result.get("selected_stream", {})
-    logger.info("TITLE_OK | título=%r | post_id=%s | seleccionado=%s | formato=%s | stream_host=%s | index=%s | total=%s | attempt=%s | %.0fms", title, selected_id, selected.get("nombre"), selected.get("stream_format"), _safe_host(selected.get("url", "")), result.get("selected_index"), result.get("total"), attempt, (time.monotonic()-started)*1000)
+    logger.info("TITLE_OK | título=%r | post_id=%s | seleccionado=%s | formato=%s | stream_host=%s | fp=%s | index=%s | total=%s | attempt=%s | %.0fms", title, selected_id, selected.get("nombre"), selected.get("stream_format"), _safe_host(selected.get("url", "")), _safe_stream_fingerprint(selected.get("url", "")), result.get("selected_index"), result.get("total"), attempt, (time.monotonic()-started)*1000)
     return result
