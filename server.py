@@ -202,6 +202,97 @@ def resolver_ytdlp(url: str):
         return None
 
 
+def validar_hls_playlist(stream_url: str):
+    """Comprueba de forma ligera un m3u8 antes de entregarlo al Roku.
+
+    Solo descarta fallos claros (HTTP 4xx/5xx o contenido que no parece HLS).
+    Si la comprobación no puede completarse por timeout/red, se conserva el
+    stream para no convertir un problema temporal de validación en un fallo
+    de reproducción.
+    """
+    started = time.monotonic()
+    host = _safe_host(stream_url)
+    req_headers = HEADERS.copy()
+    req_headers["Accept"] = "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
+
+    try:
+        r = requests.get(stream_url, headers=req_headers, timeout=(3, 5))
+        elapsed = (time.monotonic() - started) * 1000
+        status = r.status_code
+        content_type = r.headers.get("Content-Type", "")
+        body = r.text[:200000]
+
+        if status >= 400:
+            logger.warning(
+                "HLS_CHECK | host=%s | HTTP=%s | content_type=%s | resultado=DESCARTAR | %.0fms",
+                host, status, content_type[:80], elapsed,
+            )
+            return False, {"estado": "http", "status": status, "content_type": content_type}
+
+        if not body.lstrip().startswith("#EXTM3U"):
+            logger.warning(
+                "HLS_CHECK | host=%s | HTTP=%s | content_type=%s | resultado=NO-HLS | %.0fms",
+                host, status, content_type[:80], elapsed,
+            )
+            return False, {"estado": "contenido_no_hls", "status": status, "content_type": content_type}
+
+        is_master = "#EXT-X-STREAM-INF" in body
+        is_media = "#EXTINF" in body or "#EXT-X-TARGETDURATION" in body
+        variants = len(re.findall(r"#EXT-X-STREAM-INF:", body))
+        codecs = []
+        for match in re.findall(r'CODECS="([^"]+)"', body):
+            for codec in match.split(","):
+                codec = codec.strip()
+                if codec and codec not in codecs:
+                    codecs.append(codec)
+
+        resolutions = re.findall(r"RESOLUTION=(\d+x\d+)", body)
+        max_resolution = None
+        if resolutions:
+            def area(value):
+                try:
+                    w, h = value.split("x", 1)
+                    return int(w) * int(h)
+                except Exception:
+                    return 0
+            max_resolution = max(resolutions, key=area)
+
+        playlist_type = "master" if is_master else ("media" if is_media else "hls")
+        logger.info(
+            "HLS_CHECK | host=%s | HTTP=%s | tipo=%s | variantes=%s | max_res=%s | codecs=%s | bytes=%s | resultado=OK | %.0fms",
+            host, status, playlist_type, variants, max_resolution or "?",
+            ",".join(codecs)[:180] or "?", len(r.content), elapsed,
+        )
+        return True, {
+            "estado": "ok",
+            "status": status,
+            "content_type": content_type,
+            "playlist_type": playlist_type,
+            "variants": variants,
+            "max_resolution": max_resolution,
+            "codecs": codecs,
+            "bytes": len(r.content),
+        }
+    except requests.Timeout:
+        logger.warning(
+            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=TIMEOUT | %.0fms",
+            host, (time.monotonic() - started) * 1000,
+        )
+        return None, {"estado": "timeout"}
+    except requests.RequestException as exc:
+        logger.warning(
+            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms",
+            host, type(exc).__name__, (time.monotonic() - started) * 1000,
+        )
+        return None, {"estado": "red", "error": type(exc).__name__}
+    except Exception as exc:
+        logger.warning(
+            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms",
+            host, type(exc).__name__, (time.monotonic() - started) * 1000,
+        )
+        return None, {"estado": "error", "error": type(exc).__name__}
+
+
 def obtener_peso_prioridad(embed: dict) -> int:
     raw_url = str(embed.get("url", "")).lower()
     for servidor, peso in SERVER_PRIORITY.items():
@@ -259,6 +350,20 @@ def procesar_un_embed(index: int, embed: dict):
         stream_format = "mp4"
     else:
         stream_format = "mp4"
+
+    if stream_format == "hls":
+        hls_ok, hls_info = validar_hls_playlist(stream_url)
+        if hls_ok is False:
+            logger.warning(
+                "EMBED %s | host=%s | formato=hls | resultado=DESCARTADO-POR-HLS | motivo=%s",
+                index, host, hls_info.get("estado", "desconocido"),
+            )
+            return None
+        if hls_ok is None:
+            logger.info(
+                "EMBED %s | host=%s | formato=hls | resultado=VALIDACIÓN-NO-CONCLUSIVA | se-conserva=SI",
+                index, host,
+            )
 
     logger.info("EMBED %s | host=%s | formato=%s | resultado=STREAM-VÁLIDO | %.0fms", index, host, stream_format, (time.monotonic()-started)*1000)
     return {
