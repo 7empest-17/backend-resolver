@@ -438,20 +438,29 @@ def _resolve_post(post_id: int, attempt: int = 0):
     logger.info("RESOLVE_START | post_id=%s | attempt=%s", post_id, attempt)
 
     cached = STREAM_CACHE.get(post_id)
-    # Las respuestas cacheadas contienen todos los candidatos. Para intentos
-    # posteriores reutilizamos otro candidato si existe; si ya no quedan,
-    # forzamos una nueva resolución para obtener URLs nuevas.
-    if cached and cached["expires_at"] > now:
+    # Intento 0: reutilizamos el conjunto cacheado durante TTL5.
+    # Intentos posteriores: NO saltamos automáticamente a Goodstream/VOE.
+    # Forzamos una nueva consulta a Lamovie para darle prioridad a Vimeos y
+    # tener oportunidad de obtener otra URL Vimeos rotativa.
+    if attempt == 0 and cached and cached["expires_at"] > now:
         data = cached["data"]
         streams = data.get("streams", []) if isinstance(data, dict) else []
-        if attempt < len(streams):
-            selected = streams[attempt]
+        if streams:
+            selected = streams[0]
             response = dict(data)
             response["selected_stream"] = selected
-            response["selected_index"] = attempt
-            logger.info("RESOLVE_CACHE_CANDIDATE | post_id=%s | attempt=%s | index=%s | %.0fms", post_id, attempt, attempt, (time.monotonic()-started)*1000)
+            response["selected_index"] = 0
+            logger.info(
+                "RESOLVE_CACHE_CANDIDATE | post_id=%s | attempt=0 | index=0 | host=%s | nombre=%s | %.0fms",
+                post_id, _safe_host(selected.get("url", "")), selected.get("nombre"),
+                (time.monotonic()-started)*1000,
+            )
             return response
-        logger.info("RESOLVE_CACHE_EXHAUSTED | post_id=%s | attempt=%s | candidates=%s | se-genera-nuevo=SI", post_id, attempt, len(streams))
+
+    if attempt > 0:
+        logger.info("RESOLVE_FRESH_FALLBACK | post_id=%s | attempt=%s | motivo=prioridad-vimeos", post_id, attempt)
+    elif cached:
+        logger.info("RESOLVE_CACHE_EXHAUSTED | post_id=%s | attempt=%s | se-genera-nuevo=SI", post_id, attempt)
 
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
     try:
@@ -495,7 +504,30 @@ def _resolve_post(post_id: int, attempt: int = 0):
     for item in resultados:
         item.pop("peso", None)
 
-    selected_index = min(attempt, len(resultados) - 1)
+    # Política de fallback: agotar Vimeos antes de probar otros proveedores.
+    # attempt=0 usa el primer Vimeos; attempt=1 el segundo; attempt=2 el tercero.
+    # Si ya no hay más Vimeos, se usa el siguiente candidato no-Vimeos como
+    # alternativa final, manteniendo la prioridad original entre proveedores.
+    vimeos_indexes = [
+        i for i, item in enumerate(resultados)
+        if "vimeos" in str(item.get("nombre", "")).lower() or "vimeos" in str(item.get("url", "")).lower()
+    ]
+    non_vimeos_indexes = [i for i in range(len(resultados)) if i not in vimeos_indexes]
+
+    if attempt < len(vimeos_indexes):
+        selected_index = vimeos_indexes[attempt]
+        selected_reason = "vimeos-prioritario"
+    else:
+        fallback_index = attempt - len(vimeos_indexes)
+        if fallback_index < len(non_vimeos_indexes):
+            selected_index = non_vimeos_indexes[fallback_index]
+            selected_reason = "alternativa-no-vimeos"
+        else:
+            # Si no quedan candidatos, reutilizar el último disponible evita
+            # romper el contrato del endpoint; Roku limita los intentos a 3.
+            selected_index = vimeos_indexes[-1] if vimeos_indexes else 0
+            selected_reason = "sin-candidato-nuevo"
+
     respuesta = {
         "status": "success",
         "post_id": post_id,
@@ -507,8 +539,9 @@ def _resolve_post(post_id: int, attempt: int = 0):
     }
 
     logger.info(
-        "RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | index=%s | %.0fms",
+        "RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | index=%s | motivo=%s | host=%s | attempt=%s | %.0fms",
         post_id, len(resultados), resultados[selected_index].get("nombre"), selected_index,
+        selected_reason, _safe_host(resultados[selected_index].get("url", "")), attempt,
         (time.monotonic()-started)*1000,
     )
 
