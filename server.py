@@ -432,15 +432,26 @@ def procesar_un_embed(index: int, embed: dict):
     }
 
 
-def _resolve_post(post_id: int):
+def _resolve_post(post_id: int, attempt: int = 0):
     started = time.monotonic()
     now = time.time()
-    logger.info("RESOLVE_START | post_id=%s", post_id)
+    logger.info("RESOLVE_START | post_id=%s | attempt=%s", post_id, attempt)
 
     cached = STREAM_CACHE.get(post_id)
+    # Las respuestas cacheadas contienen todos los candidatos. Para intentos
+    # posteriores reutilizamos otro candidato si existe; si ya no quedan,
+    # forzamos una nueva resolución para obtener URLs nuevas.
     if cached and cached["expires_at"] > now:
-        logger.info("RESOLVE_CACHE_HIT | post_id=%s | %.0fms", post_id, (time.monotonic()-started)*1000)
-        return cached["data"]
+        data = cached["data"]
+        streams = data.get("streams", []) if isinstance(data, dict) else []
+        if attempt < len(streams):
+            selected = streams[attempt]
+            response = dict(data)
+            response["selected_stream"] = selected
+            response["selected_index"] = attempt
+            logger.info("RESOLVE_CACHE_CANDIDATE | post_id=%s | attempt=%s | index=%s | %.0fms", post_id, attempt, attempt, (time.monotonic()-started)*1000)
+            return response
+        logger.info("RESOLVE_CACHE_EXHAUSTED | post_id=%s | attempt=%s | candidates=%s | se-genera-nuevo=SI", post_id, attempt, len(streams))
 
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
     try:
@@ -457,22 +468,21 @@ def _resolve_post(post_id: int):
     if not isinstance(embeds, list) or not embeds:
         raise HTTPException(status_code=404, detail="No se encontraron servidores para este post")
 
-    # Importante: no disparamos cinco resoluciones a la vez.
-    # Se procesan en orden de prioridad para reducir solicitudes simultáneas
-    # y evitar que un problema de un proveedor bloquee innecesariamente a los demás.
     indexed = list(enumerate(embeds))
     indexed.sort(key=lambda item: (obtener_peso_prioridad(item[1]), item[0]))
 
     resultados = []
+    seen_urls = set()
     for idx, embed in indexed:
         resultado = procesar_un_embed(idx, embed)
-        if resultado:
-            resultados.append(resultado)
-
-        # Con al menos un resultado prioritario ya podemos continuar.
-        # Los demás se intentan solo cuando son necesarios para ofrecer fallback.
-        if resultados and resultados[0]["peso"] <= 2:
-            break
+        if not resultado:
+            continue
+        normalized_url = resultado.get("url", "").strip()
+        if normalized_url in seen_urls:
+            logger.info("EMBED %s | resultado=DESCARTADO-DUPLICADO", idx)
+            continue
+        seen_urls.add(normalized_url)
+        resultados.append(resultado)
 
     if not resultados:
         logger.warning("RESOLVE_FAIL | post_id=%s | ningún stream válido | %.0fms", post_id, (time.monotonic()-started)*1000)
@@ -485,15 +495,22 @@ def _resolve_post(post_id: int):
     for item in resultados:
         item.pop("peso", None)
 
+    selected_index = min(attempt, len(resultados) - 1)
     respuesta = {
         "status": "success",
         "post_id": post_id,
-        "selected_stream": resultados[0],
+        "selected_stream": resultados[selected_index],
+        "selected_index": selected_index,
         "total": len(resultados),
         "streams": resultados,
+        "attempt": attempt,
     }
 
-    logger.info("RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | %.0fms", post_id, len(resultados), resultados[0].get("nombre"), (time.monotonic()-started)*1000)
+    logger.info(
+        "RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | index=%s | %.0fms",
+        post_id, len(resultados), resultados[selected_index].get("nombre"), selected_index,
+        (time.monotonic()-started)*1000,
+    )
 
     STREAM_CACHE[post_id] = {
         "data": respuesta,
@@ -513,11 +530,14 @@ def health():
 
 
 @app.get("/api/stream")
-def get_stream(post_id: int = Query(..., description="ID del post en la API")):
+def get_stream(
+    post_id: int = Query(..., description="ID del post en la API"),
+    attempt: int = Query(0, ge=0, le=9, description="Índice de candidato/fallback"),
+):
     # Serializa peticiones simultáneas del mismo título/post.
     lock = get_post_lock(post_id)
     with lock:
-        return _resolve_post(post_id)
+        return _resolve_post(post_id, attempt=attempt)
 
 
 def normalize_text(value):
@@ -561,6 +581,7 @@ def get_tmdb_localized_title(title: str, year: str = None):
 def resolve_by_title(
     title: str = Query(..., description="Título de la película o serie"),
     year: str = Query(None, description="Año de estreno opcional"),
+    attempt: int = Query(0, ge=0, le=9, description="Índice de candidato/fallback"),
 ):
     """Busca una película por título/año y devuelve un stream fresco."""
     started = time.monotonic()
@@ -648,7 +669,7 @@ def resolve_by_title(
     if not selected_id:
         raise HTTPException(status_code=502, detail="La API encontró el título pero no devolvió _id")
 
-    result = get_stream(post_id=selected_id)
+    result = get_stream(post_id=selected_id, attempt=attempt)
     result["mapping"] = {
         "requested_title": title,
         "requested_year": year,
@@ -661,5 +682,5 @@ def resolve_by_title(
         "post_id": selected_id,
     }
     selected = result.get("selected_stream", {})
-    logger.info("TITLE_OK | título=%r | post_id=%s | seleccionado=%s | formato=%s | stream_host=%s | total=%s | %.0fms", title, selected_id, selected.get("nombre"), selected.get("stream_format"), _safe_host(selected.get("url", "")), result.get("total"), (time.monotonic()-started)*1000)
+    logger.info("TITLE_OK | título=%r | post_id=%s | seleccionado=%s | formato=%s | stream_host=%s | index=%s | total=%s | attempt=%s | %.0fms", title, selected_id, selected.get("nombre"), selected.get("stream_format"), _safe_host(selected.get("url", "")), result.get("selected_index"), result.get("total"), attempt, (time.monotonic()-started)*1000)
     return result
