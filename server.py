@@ -2,7 +2,7 @@ import os
 import re
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
 import requests
 import yt_dlp
@@ -10,6 +10,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Roku Stream Resolver Master")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("roku-resolver")
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,6 +94,14 @@ def extract_m3u8(html: str):
     return None
 
 
+def _safe_host(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def resolver_vimeos(url: str):
     try:
         req_headers = HEADERS.copy()
@@ -114,7 +125,14 @@ def resolver_vimeos(url: str):
         )
         if match_file:
             return match_file.group(1).replace(r"\/", "/")
-    except Exception:
+    except requests.HTTPError as exc:
+        logger.warning("RESOLVER vimeos | host=%s | HTTP=%s", _safe_host(url), getattr(exc.response, "status_code", "?"))
+        return None
+    except requests.Timeout:
+        logger.warning("RESOLVER vimeos | host=%s | TIMEOUT", _safe_host(url))
+        return None
+    except Exception as exc:
+        logger.warning("RESOLVER vimeos | host=%s | ERROR=%s", _safe_host(url), type(exc).__name__)
         return None
     return None
 
@@ -149,7 +167,14 @@ def resolver_voe(url: str):
         match_mp4 = re.search(r"['\"]mp4['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
         if match_mp4:
             return match_mp4.group(1).replace(r"\/", "/")
-    except Exception:
+    except requests.HTTPError as exc:
+        logger.warning("RESOLVER voe | host=%s | HTTP=%s", _safe_host(url), getattr(exc.response, "status_code", "?"))
+        return None
+    except requests.Timeout:
+        logger.warning("RESOLVER voe | host=%s | TIMEOUT", _safe_host(url))
+        return None
+    except Exception as exc:
+        logger.warning("RESOLVER voe | host=%s | ERROR=%s", _safe_host(url), type(exc).__name__)
         return None
     return None
 
@@ -172,7 +197,8 @@ def resolver_ytdlp(url: str):
             if not info:
                 return None
             return info.get("url")
-    except Exception:
+    except Exception as exc:
+        logger.warning("RESOLVER yt-dlp | host=%s | ERROR=%s | detalle=%s", _safe_host(url), type(exc).__name__, str(exc)[:180])
         return None
 
 
@@ -185,28 +211,45 @@ def obtener_peso_prioridad(embed: dict) -> int:
 
 
 def procesar_un_embed(index: int, embed: dict):
+    started = time.monotonic()
     raw_url = str(embed.get("url", "")).replace(r"\/", "/").strip()
     if not raw_url:
+        logger.warning("EMBED %s | vacío | duración=0ms", index)
         return None
 
     servidor = embed.get("server", "Online")
     idioma = embed.get("lang", "Latino")
     calidad = embed.get("quality", "Full HD")
+    host = _safe_host(raw_url)
     stream_url = None
+    metodo = None
 
-    # Primero usamos los resolvers específicos existentes.
-    # Solo si no obtienen un stream se prueba yt-dlp de forma estándar.
-    if "vimeos" in raw_url:
-        stream_url = resolver_vimeos(raw_url)
-    elif "goodstream" in raw_url:
-        stream_url = resolver_goodstream(raw_url)
-    elif "voe.sx" in raw_url:
-        stream_url = resolver_voe(raw_url)
+    try:
+        if "vimeos" in raw_url:
+            metodo = "vimeos"
+            stream_url = resolver_vimeos(raw_url)
+        elif "goodstream" in raw_url:
+            metodo = "goodstream"
+            stream_url = resolver_goodstream(raw_url)
+        elif "voe.sx" in raw_url:
+            metodo = "voe"
+            stream_url = resolver_voe(raw_url)
 
-    if not stream_url:
-        stream_url = resolver_ytdlp(raw_url)
+        if stream_url:
+            logger.info("EMBED %s | host=%s | método=%s | resultado=OK-específico | %.0fms", index, host, metodo, (time.monotonic()-started)*1000)
+        else:
+            metodo = "yt-dlp"
+            stream_url = resolver_ytdlp(raw_url)
+            if stream_url:
+                logger.info("EMBED %s | host=%s | método=yt-dlp | resultado=OK | %.0fms", index, host, (time.monotonic()-started)*1000)
+            else:
+                logger.warning("EMBED %s | host=%s | método=yt-dlp | resultado=FALLO | %.0fms", index, host, (time.monotonic()-started)*1000)
+    except Exception as exc:
+        logger.exception("EMBED %s | host=%s | método=%s | excepción=%s | %.0fms", index, host, metodo or "desconocido", type(exc).__name__, (time.monotonic()-started)*1000)
+        return None
 
     if not stream_url or not re.match(r"^https?://", stream_url):
+        logger.warning("EMBED %s | host=%s | resultado=URL-inválida | %.0fms", index, host, (time.monotonic()-started)*1000)
         return None
 
     stream_lower = stream_url.lower()
@@ -215,10 +258,9 @@ def procesar_un_embed(index: int, embed: dict):
     elif ".mp4" in stream_lower:
         stream_format = "mp4"
     else:
-        # Conservador: si yt-dlp devuelve una URL válida pero sin extensión,
-        # mantenemos hls solo cuando la URL lo indica explícitamente.
         stream_format = "mp4"
 
+    logger.info("EMBED %s | host=%s | formato=%s | resultado=STREAM-VÁLIDO | %.0fms", index, host, stream_format, (time.monotonic()-started)*1000)
     return {
         "id": index,
         "peso": obtener_peso_prioridad(embed),
@@ -229,10 +271,13 @@ def procesar_un_embed(index: int, embed: dict):
 
 
 def _resolve_post(post_id: int):
+    started = time.monotonic()
     now = time.time()
+    logger.info("RESOLVE_START | post_id=%s", post_id)
 
     cached = STREAM_CACHE.get(post_id)
     if cached and cached["expires_at"] > now:
+        logger.info("RESOLVE_CACHE_HIT | post_id=%s | %.0fms", post_id, (time.monotonic()-started)*1000)
         return cached["data"]
 
     player_url = f"{LAMOVIE_API_BASE}/player?postId={post_id}&demo=0"
@@ -246,6 +291,7 @@ def _resolve_post(post_id: int):
         raise HTTPException(status_code=502, detail="La API de servidores devolvió JSON inválido")
 
     embeds = res_json.get("data", {}).get("embeds", [])
+    logger.info("EMBEDS | post_id=%s | count=%s", post_id, len(embeds) if isinstance(embeds, list) else "invalid")
     if not isinstance(embeds, list) or not embeds:
         raise HTTPException(status_code=404, detail="No se encontraron servidores para este post")
 
@@ -267,6 +313,7 @@ def _resolve_post(post_id: int):
             break
 
     if not resultados:
+        logger.warning("RESOLVE_FAIL | post_id=%s | ningún stream válido | %.0fms", post_id, (time.monotonic()-started)*1000)
         raise HTTPException(
             status_code=502,
             detail="No se pudo resolver ningún servidor. El proveedor puede estar temporalmente inaccesible o protegido.",
@@ -284,6 +331,8 @@ def _resolve_post(post_id: int):
         "streams": resultados,
     }
 
+    logger.info("RESOLVE_OK | post_id=%s | streams=%s | seleccionado=%s | %.0fms", post_id, len(resultados), resultados[0].get("nombre"), (time.monotonic()-started)*1000)
+
     STREAM_CACHE[post_id] = {
         "data": respuesta,
         "expires_at": now + STREAM_CACHE_TTL,
@@ -293,7 +342,7 @@ def _resolve_post(post_id: int):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "roku-stream-resolver-v2"}
+    return {"status": "ok", "service": "roku-stream-resolver-v3-diagnostics"}
 
 
 @app.get("/health")
@@ -352,7 +401,9 @@ def resolve_by_title(
     year: str = Query(None, description="Año de estreno opcional"),
 ):
     """Busca una película por título/año y devuelve un stream fresco."""
+    started = time.monotonic()
     now = time.time()
+    logger.info("TITLE_START | título=%r | año=%r", title, year)
     clean_year = year.strip()[:4] if year and year.strip() else ""
     cache_key = f"{title.lower().strip()}_{clean_year}"
 
@@ -379,8 +430,10 @@ def resolve_by_title(
             data = r.json().get("data", {})
             posts = data.get("posts", [])
         except requests.RequestException as exc:
+            logger.warning("SEARCH_FAIL | título=%r | tipo=%s | detalle=%s", title, type(exc).__name__, str(exc)[:180])
             raise HTTPException(status_code=502, detail=f"Error buscando en la API: {exc}")
         except ValueError:
+            logger.warning("SEARCH_FAIL | título=%r | JSON inválido", title)
             raise HTTPException(status_code=502, detail="La API de búsqueda devolvió JSON inválido")
 
         if not posts:
@@ -428,6 +481,8 @@ def resolve_by_title(
         }
 
     selected_id = selected_post.get("_id")
+    logger.info("TITLE_MATCH | solicitado=%r | encontrado=%r | post_id=%s | cache=%s", title, selected_post.get("original_title") or selected_post.get("title") or selected_post.get("post_title"), selected_post.get("_id"), bool(cached_search))
+
     if not selected_id:
         raise HTTPException(status_code=502, detail="La API encontró el título pero no devolvió _id")
 
@@ -443,4 +498,6 @@ def resolve_by_title(
         "release_date": selected_post.get("release_date"),
         "post_id": selected_id,
     }
+    selected = result.get("selected_stream", {})
+    logger.info("TITLE_OK | título=%r | post_id=%s | seleccionado=%s | formato=%s | stream_host=%s | total=%s | %.0fms", title, selected_id, selected.get("nombre"), selected.get("stream_format"), _safe_host(selected.get("url", "")), result.get("total"), (time.monotonic()-started)*1000)
     return result
