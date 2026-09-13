@@ -96,7 +96,7 @@ def extract_m3u8(html: str):
 
 def _safe_host(url: str) -> str:
     try:
-        from urllib.parse import urlparse
+        from urllib.parse import urlparse, urljoin
         return urlparse(url).netloc or "unknown"
     except Exception:
         return "unknown"
@@ -202,50 +202,74 @@ def resolver_ytdlp(url: str):
         return None
 
 
-def validar_hls_playlist(stream_url: str):
-    """Comprueba de forma ligera un m3u8 antes de entregarlo al Roku.
+def _fetch_hls(url: str, timeout=(3, 5)):
+    req_headers = HEADERS.copy()
+    req_headers["Accept"] = "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
+    started = time.monotonic()
+    r = requests.get(url, headers=req_headers, timeout=timeout)
+    elapsed = (time.monotonic() - started) * 1000
+    return r, elapsed
 
-    Solo descarta fallos claros (HTTP 4xx/5xx o contenido que no parece HLS).
-    Si la comprobación no puede completarse por timeout/red, se conserva el
-    stream para no convertir un problema temporal de validación en un fallo
-    de reproducción.
+
+def _parse_hls_master(body: str, base_url: str):
+    variants = []
+    lines = [x.strip() for x in body.splitlines() if x.strip()]
+    pending = None
+    for line in lines:
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            attrs = {}
+            for part in re.split(r',(?=[A-Z0-9-]+=)', line.split(":", 1)[1]):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    attrs[k.strip()] = v.strip().strip('"')
+            pending = attrs
+        elif pending is not None and not line.startswith("#"):
+            item = dict(pending)
+            item["url"] = urljoin(base_url, line)
+            variants.append(item)
+            pending = None
+    return variants
+
+
+def _first_media_segment(body: str, base_url: str):
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        return urljoin(base_url, line)
+    return None
+
+
+def validar_hls_playlist(stream_url: str):
+    """Diagnóstico/validación ligera del master, variante y primer segmento.
+
+    Solo descarta fallos HTTP claros (4xx/5xx) en las comprobaciones. Los
+    timeouts y errores de red son no concluyentes y conservan el stream para
+    no romper una reproducción que pudiera funcionar.
     """
     started = time.monotonic()
     host = _safe_host(stream_url)
-    req_headers = HEADERS.copy()
-    req_headers["Accept"] = "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
-
     try:
-        r = requests.get(stream_url, headers=req_headers, timeout=(3, 5))
-        elapsed = (time.monotonic() - started) * 1000
+        r, elapsed = _fetch_hls(stream_url)
         status = r.status_code
         content_type = r.headers.get("Content-Type", "")
         body = r.text[:200000]
 
         if status >= 400:
-            logger.warning(
-                "HLS_CHECK | host=%s | HTTP=%s | content_type=%s | resultado=DESCARTAR | %.0fms",
-                host, status, content_type[:80], elapsed,
-            )
-            return False, {"estado": "http", "status": status, "content_type": content_type}
-
+            logger.warning("HLS_CHECK | etapa=master | host=%s | HTTP=%s | content_type=%s | resultado=DESCARTAR | %.0fms", host, status, content_type[:80], elapsed)
+            return False, {"estado": "http", "status": status}
         if not body.lstrip().startswith("#EXTM3U"):
-            logger.warning(
-                "HLS_CHECK | host=%s | HTTP=%s | content_type=%s | resultado=NO-HLS | %.0fms",
-                host, status, content_type[:80], elapsed,
-            )
-            return False, {"estado": "contenido_no_hls", "status": status, "content_type": content_type}
+            logger.warning("HLS_CHECK | etapa=master | host=%s | HTTP=%s | resultado=NO-HLS | %.0fms", host, status, elapsed)
+            return False, {"estado": "contenido_no_hls", "status": status}
 
         is_master = "#EXT-X-STREAM-INF" in body
-        is_media = "#EXTINF" in body or "#EXT-X-TARGETDURATION" in body
-        variants = len(re.findall(r"#EXT-X-STREAM-INF:", body))
+        variants = _parse_hls_master(body, stream_url) if is_master else []
         codecs = []
         for match in re.findall(r'CODECS="([^"]+)"', body):
             for codec in match.split(","):
                 codec = codec.strip()
                 if codec and codec not in codecs:
                     codecs.append(codec)
-
         resolutions = re.findall(r"RESOLUTION=(\d+x\d+)", body)
         max_resolution = None
         if resolutions:
@@ -257,39 +281,72 @@ def validar_hls_playlist(stream_url: str):
                     return 0
             max_resolution = max(resolutions, key=area)
 
-        playlist_type = "master" if is_master else ("media" if is_media else "hls")
-        logger.info(
-            "HLS_CHECK | host=%s | HTTP=%s | tipo=%s | variantes=%s | max_res=%s | codecs=%s | bytes=%s | resultado=OK | %.0fms",
-            host, status, playlist_type, variants, max_resolution or "?",
-            ",".join(codecs)[:180] or "?", len(r.content), elapsed,
-        )
-        return True, {
-            "estado": "ok",
-            "status": status,
-            "content_type": content_type,
-            "playlist_type": playlist_type,
-            "variants": variants,
-            "max_resolution": max_resolution,
-            "codecs": codecs,
-            "bytes": len(r.content),
-        }
+        logger.info("HLS_CHECK | etapa=master | host=%s | HTTP=%s | tipo=%s | variantes=%s | max_res=%s | codecs=%s | bytes=%s | resultado=OK | %.0fms",
+                    host, status, "master" if is_master else "media", len(variants), max_resolution or "?", ",".join(codecs)[:180] or "?", len(r.content), elapsed)
+
+        child_url = None
+        if variants:
+            def variant_score(v):
+                try:
+                    w, h = v.get("RESOLUTION", "0x0").split("x", 1)
+                    return int(w) * int(h)
+                except Exception:
+                    return 0
+            variants.sort(key=variant_score, reverse=True)
+            child_url = variants[0].get("url")
+        else:
+            child_url = stream_url
+
+        try:
+            child, child_elapsed = _fetch_hls(child_url)
+            child_status = child.status_code
+            child_body = child.text[:200000]
+            child_type = child.headers.get("Content-Type", "")
+            if child_status >= 400:
+                logger.warning("HLS_CHECK | etapa=playlist | host=%s | HTTP=%s | resultado=DESCARTAR | %.0fms", _safe_host(child_url), child_status, child_elapsed)
+                return False, {"estado": "playlist_http", "status": child_status}
+            if not child_body.lstrip().startswith("#EXTM3U"):
+                logger.warning("HLS_CHECK | etapa=playlist | host=%s | HTTP=%s | resultado=NO-HLS | %.0fms", _safe_host(child_url), child_status, child_elapsed)
+                return False, {"estado": "playlist_no_hls", "status": child_status}
+            segments = len(re.findall(r"#EXTINF:", child_body))
+            media_segment = _first_media_segment(child_body, child_url)
+            logger.info("HLS_CHECK | etapa=playlist | host=%s | HTTP=%s | segmentos=%s | content_type=%s | resultado=OK | %.0fms", _safe_host(child_url), child_status, segments, child_type[:80], child_elapsed)
+
+            if media_segment:
+                try:
+                    seg_started = time.monotonic()
+                    req_headers = HEADERS.copy()
+                    seg = requests.get(media_segment, headers=req_headers, timeout=(3, 5), stream=True)
+                    seg_elapsed = (time.monotonic() - seg_started) * 1000
+                    seg_status = seg.status_code
+                    seg_type = seg.headers.get("Content-Type", "")
+                    seg_length = seg.headers.get("Content-Length", "?")
+                    logger.info("HLS_CHECK | etapa=segmento1 | host=%s | HTTP=%s | content_type=%s | bytes=%s | resultado=%s | %.0fms",
+                                _safe_host(media_segment), seg_status, seg_type[:80], seg_length,
+                                "OK" if seg_status < 400 else "DESCARTAR", seg_elapsed)
+                    seg.close()
+                    if seg_status >= 400:
+                        return False, {"estado": "segmento_http", "status": seg_status}
+                except requests.Timeout:
+                    logger.warning("HLS_CHECK | etapa=segmento1 | host=%s | resultado=NO-CONCLUSIVO | motivo=TIMEOUT", _safe_host(media_segment))
+                except requests.RequestException as exc:
+                    logger.warning("HLS_CHECK | etapa=segmento1 | host=%s | resultado=NO-CONCLUSIVO | motivo=%s", _safe_host(media_segment), type(exc).__name__)
+            else:
+                logger.warning("HLS_CHECK | etapa=segmento1 | host=%s | resultado=NO-SEGMENTO", _safe_host(child_url))
+        except requests.Timeout:
+            logger.warning("HLS_CHECK | etapa=playlist | host=%s | resultado=NO-CONCLUSIVO | motivo=TIMEOUT", _safe_host(child_url))
+        except requests.RequestException as exc:
+            logger.warning("HLS_CHECK | etapa=playlist | host=%s | resultado=NO-CONCLUSIVO | motivo=%s", _safe_host(child_url), type(exc).__name__)
+
+        return True, {"estado": "ok", "status": status, "playlist_type": "master" if is_master else "media", "variants": len(variants), "max_resolution": max_resolution, "codecs": codecs}
     except requests.Timeout:
-        logger.warning(
-            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=TIMEOUT | %.0fms",
-            host, (time.monotonic() - started) * 1000,
-        )
+        logger.warning("HLS_CHECK | etapa=master | host=%s | resultado=NO-CONCLUSIVO | motivo=TIMEOUT | %.0fms", host, (time.monotonic()-started)*1000)
         return None, {"estado": "timeout"}
     except requests.RequestException as exc:
-        logger.warning(
-            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms",
-            host, type(exc).__name__, (time.monotonic() - started) * 1000,
-        )
+        logger.warning("HLS_CHECK | etapa=master | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms", host, type(exc).__name__, (time.monotonic()-started)*1000)
         return None, {"estado": "red", "error": type(exc).__name__}
     except Exception as exc:
-        logger.warning(
-            "HLS_CHECK | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms",
-            host, type(exc).__name__, (time.monotonic() - started) * 1000,
-        )
+        logger.warning("HLS_CHECK | etapa=master | host=%s | resultado=NO-CONCLUSIVO | motivo=%s | %.0fms", host, type(exc).__name__, (time.monotonic()-started)*1000)
         return None, {"estado": "error", "error": type(exc).__name__}
 
 
