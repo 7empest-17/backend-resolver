@@ -5,6 +5,7 @@ import threading
 import logging
 
 import requests
+from urllib.parse import urlparse, urljoin
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,7 +97,6 @@ def extract_m3u8(html: str):
 
 def _safe_host(url: str) -> str:
     try:
-        from urllib.parse import urlparse, urljoin
         return urlparse(url).netloc or "unknown"
     except Exception:
         return "unknown"
