@@ -42,7 +42,7 @@ SEARCH_CACHE = {}
 SEARCH_CACHE_TTL = 7200
 
 STREAM_CACHE = {}
-STREAM_CACHE_TTL = 60
+STREAM_CACHE_TTL = 5
 
 # Evita que dos peticiones simultáneas para el mismo post disparen resoluciones duplicadas.
 POST_LOCKS = {}
